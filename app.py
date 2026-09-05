@@ -1,0 +1,501 @@
+"""
+Solana Memecoin Signal Bot — v2.2
+==================================
+A research / alerting dashboard for Solana memecoins. This tool is
+informational only:
+
+  - No private keys are ever requested, stored, or used.
+  - No trades are ever executed by this app.
+  - Every score is a heuristic proxy, not financial advice.
+
+Run modes:
+  - Demo Mode: fully synthetic data, works with zero setup / zero API keys.
+  - CSV Mode: bring your own wallets / tokens / buy-events CSVs.
+  - Live Mode: pulls real data from the public Solana RPC (and, if you
+    provide a bearer token in secrets, the X API) — slower and rate-limited.
+
+See README.md for setup, architecture, and how to wire up live mode.
+"""
+
+import time
+import pandas as pd
+import streamlit as st
+
+from modules import demo_data as dd
+from modules import wallet_intel as wi
+from modules import buy_sell as bs
+from modules import convergence as conv
+from modules import x_attention as xa
+from modules import safety_gate as sg
+from modules.solana_client import SolanaClient, SolanaRpcError
+
+st.set_page_config(
+    page_title="Solana Memecoin Signal Bot v2.2",
+    page_icon="🛰️",
+    layout="wide",
+)
+
+STATUS_COLORS = {
+    "BLOCKED": "#7f1d1d",
+    "WATCH": "#78716c",
+    "BUILDING": "#a16207",
+    "ALERT": "#15803d",
+}
+
+
+def status_badge(status: str) -> str:
+    color = STATUS_COLORS.get(status, "#334155")
+    return (
+        f'<span style="background-color:{color};color:white;padding:3px 10px;'
+        f'border-radius:6px;font-weight:600;font-size:0.85rem;">{status}</span>'
+    )
+
+
+# --------------------------------------------------------------------------
+# Sidebar — mode + settings
+# --------------------------------------------------------------------------
+
+st.sidebar.title("🛰️ Signal Bot v2.2")
+mode = st.sidebar.radio(
+    "Data source",
+    ["Demo Mode", "CSV Upload", "Live (Solana RPC)"],
+    help="Demo Mode needs no setup. CSV Upload lets you bring your own "
+         "wallet/token/buy-event exports. Live Mode calls the real Solana RPC.",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "⚠️ No private keys are ever requested. This app never places trades. "
+    "All scores are heuristic research signals, not financial advice."
+)
+
+def _get_secret(key: str, default: str = "") -> str:
+    """Safely read from st.secrets even when no secrets.toml exists locally."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+rpc_url = None
+x_bearer = None
+if mode == "Live (Solana RPC)":
+    st.sidebar.subheader("Live mode settings")
+    rpc_url = st.sidebar.text_input(
+        "Solana RPC URL",
+        value=_get_secret("SOLANA_RPC_URL"),
+        placeholder="https://your-rpc-provider.com/...",
+        help="Public RPC is heavily rate-limited. For reliable use, get a "
+             "free/paid endpoint from Helius, QuickNode, or Triton.",
+    )
+    x_bearer = st.sidebar.text_input(
+        "X (Twitter) API bearer token (optional)",
+        value=_get_secret("X_BEARER_TOKEN"),
+        type="password",
+        help="Leave blank to keep using simulated attention data even in Live Mode.",
+    )
+
+st.title("Solana Memecoin Signal Bot")
+st.caption("Wallet intelligence · convergence detection · X attention · safety gate — alerts only, no auto-trading")
+
+tabs = st.tabs([
+    "📊 Overview",
+    "👛 Wallet Scanner",
+    "🧠 Wallet Intelligence",
+    "🔗 Convergence",
+    "📣 X Attention",
+    "🛡️ Safety Gate",
+    "🔍 Token Inspector",
+])
+
+
+# --------------------------------------------------------------------------
+# Data loading per-mode
+# --------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _demo_data():
+    wallets = dd.generate_demo_wallets()
+    tokens = dd.generate_demo_tokens()
+    buys = dd.generate_demo_buy_events(wallets, tokens)
+    return wallets, tokens, buys
+
+
+def load_data():
+    if mode == "Demo Mode":
+        return _demo_data()
+
+    if mode == "CSV Upload":
+        st.sidebar.subheader("Upload CSVs")
+        w_file = st.sidebar.file_uploader("Wallets CSV", type="csv", key="w")
+        t_file = st.sidebar.file_uploader("Tokens CSV", type="csv", key="t")
+        b_file = st.sidebar.file_uploader("Buy events CSV", type="csv", key="b")
+
+        wallets = dd.load_csv(w_file) if w_file else pd.DataFrame()
+        tokens = dd.load_csv(t_file) if t_file else pd.DataFrame()
+        buys = dd.load_csv(b_file) if b_file else pd.DataFrame()
+
+        if wallets.empty or tokens.empty:
+            st.info(
+                "Upload wallets + tokens CSVs in the sidebar to begin, or "
+                "download the sample files below as a template.",
+                icon="📄",
+            )
+            for name in ["sample_wallets.csv", "sample_tokens.csv", "sample_buy_events.csv"]:
+                try:
+                    with open(f"data/{name}", "rb") as f:
+                        st.sidebar.download_button(f"Download {name}", f, file_name=name)
+                except FileNotFoundError:
+                    pass
+        return wallets, tokens, buys
+
+    # Live mode: wallets/buys still come from CSV upload or demo scaffolding,
+    # because discovering *which* wallets to watch from scratch requires a
+    # curated watchlist — this app scores whatever wallets/tokens you feed it,
+    # live, against the real chain. See README "Live mode" section.
+    st.sidebar.subheader("Watchlist input")
+    wl_file = st.sidebar.file_uploader(
+        "Watchlist CSV (columns: wallet, token_mint, ticker)", type="csv", key="wl"
+    )
+    if wl_file is None:
+        st.info(
+            "Live Mode scores a watchlist you provide against the real Solana "
+            "chain. Upload a CSV with columns: wallet, token_mint, ticker.",
+            icon="🛰️",
+        )
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    watchlist = dd.load_csv(wl_file)
+    return watchlist, pd.DataFrame(), pd.DataFrame()
+
+
+wallets_df, tokens_df, buys_df = load_data()
+
+
+# --------------------------------------------------------------------------
+# Tab 1: Overview
+# --------------------------------------------------------------------------
+
+with tabs[0]:
+    st.subheader("Unified status board")
+    st.write(
+        "Every token gets one combined status, driven by the safety gate "
+        "first, then wallet + attention signals:"
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(f"{status_badge('BLOCKED')}", unsafe_allow_html=True)
+    c1.caption("Failed a hard safety check. Never alerted, regardless of other signals.")
+    c2.markdown(f"{status_badge('WATCH')}", unsafe_allow_html=True)
+    c2.caption("Passes safety. Signals still early/weak.")
+    c3.markdown(f"{status_badge('BUILDING')}", unsafe_allow_html=True)
+    c3.caption("Passes safety. Multiple signals trending up.")
+    c4.markdown(f"{status_badge('ALERT')}", unsafe_allow_html=True)
+    c4.caption("Passes safety. Strong convergence + attention spike.")
+
+    st.markdown("---")
+
+    if mode != "Live (Solana RPC)" and (wallets_df.empty or tokens_df.empty):
+        st.warning("No data loaded yet.")
+    elif not tokens_df.empty:
+        overview_rows = []
+        for _, token in tokens_df.iterrows():
+            largest_accounts = [
+                {"uiAmount": token["total_supply"] * s}
+                for s in [0.15, 0.08, 0.05, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01, 0.01]
+            ]
+            # Scale synthetic holders so top10 share roughly matches the demo column
+            scale = token["top10_holder_share"] / 0.42
+            largest_accounts = [{"uiAmount": a["uiAmount"] * scale} for a in largest_accounts]
+
+            safety = sg.run_safety_gate(
+                mint_account_info={"value": {"data": {"parsed": {"info": {
+                    "mintAuthority": None if token["mint_authority_renounced"] else "SomeAuthorityPubkey",
+                    "freezeAuthority": None if token["freeze_authority_renounced"] else "SomeAuthorityPubkey",
+                }}}}},
+                largest_accounts=largest_accounts,
+                total_supply=token["total_supply"],
+                lp_locked=token["lp_locked"],
+                simulated_sell_ok=token["sell_simulation_ok"],
+            )
+
+            token_buys = buys_df[buys_df["token_mint"] == token["token_mint"]] if not buys_df.empty else pd.DataFrame()
+            wallet_count = token_buys["wallet"].nunique() if not token_buys.empty else 0
+
+            timeline = xa.get_attention_timeline(token["ticker"], demo_mode=True)
+            accel = xa.compute_acceleration(timeline)
+
+            avg_score = 55  # placeholder aggregate; see Wallet Intelligence tab for real per-wallet scores
+            status = sg.unified_status(safety, wallet_count, accel["label"], avg_score)
+
+            overview_rows.append({
+                "Ticker": token["ticker"],
+                "Status": status,
+                "Safety": "✅ Pass" if safety["passed"] else f"❌ {', '.join(safety['failed_checks'])}",
+                "Converging wallets": wallet_count,
+                "X attention": accel["label"],
+                "Age (min)": token["created_minutes_ago"],
+            })
+
+        overview_df = pd.DataFrame(overview_rows)
+        for _, row in overview_df.iterrows():
+            cols = st.columns([1.2, 1, 2, 1.3, 1.3, 1])
+            cols[0].markdown(f"**{row['Ticker']}**")
+            cols[1].markdown(status_badge(row["Status"]), unsafe_allow_html=True)
+            cols[2].write(row["Safety"])
+            cols[3].write(f"{row['Converging wallets']} wallets")
+            cols[4].write(row["X attention"])
+            cols[5].write(f"{row['Age (min)']}m")
+    else:
+        st.info("Load a watchlist in the sidebar to see live results here.")
+
+
+# --------------------------------------------------------------------------
+# Tab 2: Wallet Scanner
+# --------------------------------------------------------------------------
+
+with tabs[1]:
+    st.subheader("Wallet scanner")
+    st.caption("Transaction history + likely buy/sell detection for a single wallet.")
+
+    if mode == "Live (Solana RPC)":
+        addr = st.text_input("Wallet address")
+        mint = st.text_input("Token mint to check buys/sells against")
+        limit = st.slider("How many recent signatures to pull", 5, 100, 25)
+
+        if st.button("Scan wallet", type="primary") and addr:
+            if not rpc_url:
+                st.error("Set a Solana RPC URL in the sidebar first.")
+            else:
+                client = SolanaClient(rpc_url)
+                with st.spinner("Pulling recent signatures..."):
+                    try:
+                        sigs = client.get_signatures_for_address(addr, limit=limit)
+                    except SolanaRpcError as e:
+                        st.error(f"RPC error: {e}")
+                        sigs = []
+
+                if sigs:
+                    st.write(f"Found {len(sigs)} recent signatures. Classifying trades...")
+                    trades = []
+                    progress = st.progress(0.0)
+                    for i, s in enumerate(sigs):
+                        try:
+                            tx = client.get_transaction(s["signature"])
+                            if mint:
+                                event = bs.classify_transaction(tx, addr, mint)
+                                if event:
+                                    trades.append(event)
+                        except SolanaRpcError:
+                            pass
+                        progress.progress((i + 1) / len(sigs))
+                        time.sleep(0.05)  # be gentle with public RPC rate limits
+
+                    if mint and trades:
+                        trades_df = pd.DataFrame([t.__dict__ for t in trades])
+                        st.dataframe(trades_df, use_container_width=True)
+                        st.json(bs.summarize_trades(trades))
+                    elif mint:
+                        st.info("No classifiable buy/sell events found for that mint in this window.")
+                    else:
+                        st.info("Enter a token mint above to classify buys/sells; showing raw signatures instead.")
+                        st.dataframe(pd.DataFrame(sigs), use_container_width=True)
+    else:
+        if wallets_df.empty:
+            st.info("No wallet data loaded.")
+        else:
+            st.dataframe(wallets_df, use_container_width=True)
+            st.caption(
+                "This is trade-summary data (Demo/CSV mode). Switch to Live "
+                "mode to pull real transaction history for one wallet at a time."
+            )
+
+
+# --------------------------------------------------------------------------
+# Tab 3: Wallet Intelligence
+# --------------------------------------------------------------------------
+
+with tabs[2]:
+    st.subheader("Wallet intelligence & early-runner scoring")
+    st.caption(
+        "Wallet Intelligence Score: proxy for skilled/informed trading behavior. "
+        "Early-Runner Score: how early this wallet tends to enter relative to a token's early window."
+    )
+
+    if wallets_df.empty:
+        st.info("No wallet data loaded.")
+    else:
+        rows = []
+        for _, w in wallets_df.iterrows():
+            summary = {
+                "total_trades": w.get("total_trades", 0),
+                "buy_count": w.get("buy_count", 0),
+                "sell_count": w.get("sell_count", 0),
+                "unknown_count": w.get("unknown_count", 0),
+            }
+            intel = wi.wallet_intelligence_score(summary)
+
+            token_earliest = int(tokens_df["created_minutes_ago"].min()) if not tokens_df.empty else 0
+            runner = wi.early_runner_score(
+                wallet_first_buy_time=w.get("first_trade_time"),
+                token_earliest_seen_time=w.get("first_trade_time", 0) - token_earliest * 60
+                if w.get("first_trade_time") else None,
+            )
+            rows.append({
+                "wallet": w["wallet"][:10] + "…",
+                "intel_score": intel,
+                "runner_score": runner,
+            })
+
+        ranked = wi.rank_wallets(rows)
+        st.dataframe(pd.DataFrame(ranked), use_container_width=True)
+
+
+# --------------------------------------------------------------------------
+# Tab 4: Convergence
+# --------------------------------------------------------------------------
+
+with tabs[3]:
+    st.subheader("Wallet convergence detection")
+    st.caption("Multiple independent wallets buying the same token within a short window.")
+
+    window_min = st.slider("Convergence window (minutes)", 5, 120, 30)
+    min_wallets = st.slider("Minimum wallets to flag a cluster", 2, 10, 3)
+
+    if buys_df.empty:
+        st.info("No buy-event data loaded.")
+    else:
+        events = buys_df.copy()
+        events["combined_score"] = 50  # simple default; wire to Tab 3 scores if desired
+        clusters = conv.detect_convergence(
+            events.to_dict("records"),
+            window_seconds=window_min * 60,
+            min_wallets=min_wallets,
+        )
+        if clusters:
+            for c in clusters:
+                ticker_lookup = tokens_df.set_index("token_mint")["ticker"].to_dict() if not tokens_df.empty else {}
+                ticker = ticker_lookup.get(c["token_mint"], c["token_mint"][:8] + "…")
+                st.markdown(
+                    f"**{ticker}** — {c['wallet_count']} wallets converged "
+                    f"(avg score {c['avg_wallet_score']})"
+                )
+                st.caption(f"{len(c['wallets'])} wallets: " + ", ".join(w[:8] + "…" for w in c["wallets"][:6]))
+        else:
+            st.info("No convergence clusters found at the current thresholds.")
+
+
+# --------------------------------------------------------------------------
+# Tab 5: X Attention
+# --------------------------------------------------------------------------
+
+with tabs[4]:
+    st.subheader("X (Twitter) attention engine")
+    query = st.text_input("Ticker / query to check", value="WOJAK2")
+
+    if st.button("Check attention", type="primary"):
+        use_live = mode == "Live (Solana RPC)" and bool(x_bearer)
+        timeline = xa.get_attention_timeline(query, bearer_token=x_bearer, demo_mode=not use_live)
+        accel = xa.compute_acceleration(timeline)
+        bot_share = xa.estimate_bot_share(seed=query)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Acceleration ratio", f"{accel['acceleration_ratio']}x", help="Recent hourly avg vs. prior baseline")
+        col2.metric("Label", accel["label"])
+        col3.metric("Est. bot/coordinated share", f"{bot_share:.0%}")
+
+        st.line_chart(pd.DataFrame(timeline).set_index("hour_start")["post_count"])
+        if not use_live:
+            st.caption("Showing simulated attention data (Demo Mode, or no X bearer token set).")
+
+
+# --------------------------------------------------------------------------
+# Tab 6: Safety Gate
+# --------------------------------------------------------------------------
+
+with tabs[5]:
+    st.subheader("Safety gate")
+    st.caption("Hard checks that BLOCK a token regardless of how good other signals look.")
+
+    if tokens_df.empty:
+        st.info("No token data loaded.")
+    else:
+        pick = st.selectbox("Token", tokens_df["ticker"].tolist())
+        token = tokens_df[tokens_df["ticker"] == pick].iloc[0]
+
+        largest_accounts = [
+            {"uiAmount": token["total_supply"] * s}
+            for s in [0.15, 0.08, 0.05, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01, 0.01]
+        ]
+        scale = token["top10_holder_share"] / 0.42
+        largest_accounts = [{"uiAmount": a["uiAmount"] * scale} for a in largest_accounts]
+
+        safety = sg.run_safety_gate(
+            mint_account_info={"value": {"data": {"parsed": {"info": {
+                "mintAuthority": None if token["mint_authority_renounced"] else "SomeAuthorityPubkey",
+                "freezeAuthority": None if token["freeze_authority_renounced"] else "SomeAuthorityPubkey",
+            }}}}},
+            largest_accounts=largest_accounts,
+            total_supply=token["total_supply"],
+            lp_locked=token["lp_locked"],
+            simulated_sell_ok=token["sell_simulation_ok"],
+        )
+
+        for name, result in safety["checks"].items():
+            icon = "✅" if result["passed"] else "❌"
+            st.write(f"{icon} **{name.replace('_', ' ').title()}** — {result['reason']}")
+
+        st.markdown("---")
+        st.markdown(
+            f"**Overall: {status_badge('PASS' if safety['passed'] else 'BLOCKED')}**",
+            unsafe_allow_html=True,
+        )
+
+
+# --------------------------------------------------------------------------
+# Tab 7: Token Inspector
+# --------------------------------------------------------------------------
+
+with tabs[6]:
+    st.subheader("Live token inspection")
+
+    if mode == "Live (Solana RPC)":
+        mint_addr = st.text_input("Token mint address")
+        if st.button("Inspect token", type="primary") and mint_addr:
+            if not rpc_url:
+                st.error("Set a Solana RPC URL in the sidebar first.")
+            else:
+                client = SolanaClient(rpc_url)
+                with st.spinner("Reading mint + holder data..."):
+                    try:
+                        mint_info = client.get_account_info(mint_addr)
+                        supply_info = client.get_token_supply(mint_addr)
+                        largest = client.get_token_largest_accounts(mint_addr)
+                    except SolanaRpcError as e:
+                        st.error(f"RPC error: {e}")
+                        mint_info, supply_info, largest = None, None, []
+
+                if mint_info:
+                    total_supply = float((supply_info or {}).get("uiAmount") or 0)
+                    largest_amounts = [
+                        {"uiAmount": float(a.get("uiAmount") or 0)} for a in largest
+                    ]
+                    safety = sg.run_safety_gate(
+                        mint_account_info=mint_info,
+                        largest_accounts=largest_amounts,
+                        total_supply=total_supply,
+                        lp_locked=None,   # requires a locker-specific integration — see README
+                        simulated_sell_ok=None,  # requires a sell-simulation integration — see README
+                    )
+                    for name, result in safety["checks"].items():
+                        icon = "✅" if result["passed"] else "❌"
+                        st.write(f"{icon} **{name.replace('_', ' ').title()}** — {result['reason']}")
+                    st.caption(
+                        "LP lock and honeypot checks need a dedicated integration "
+                        "(e.g. Streamflow/Team Finance locker reads, or a swap-simulation "
+                        "call) — see README.md 'Extending live mode'."
+                    )
+    else:
+        if tokens_df.empty:
+            st.info("No token data loaded.")
+        else:
+            st.dataframe(tokens_df, use_container_width=True)

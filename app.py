@@ -480,21 +480,35 @@ with tabs[6]:
                     largest_amounts = [
                         {"uiAmount": float(a.get("uiAmount") or 0)} for a in largest
                     ]
+
+                    with st.spinner("Checking RugCheck for LP-lock + risk signals..."):
+                        rc_data = rc.get_lp_lock_and_honeypot(mint_addr)
+
                     safety = sg.run_safety_gate(
                         mint_account_info=mint_info,
                         largest_accounts=largest_amounts,
                         total_supply=total_supply,
-                        lp_locked=None,   # requires a locker-specific integration — see README
-                        simulated_sell_ok=None,  # requires a sell-simulation integration — see README
+                        lp_locked=rc_data["lp_locked"],
+                        simulated_sell_ok=rc_data["honeypot_proxy"],
                     )
                     for name, result in safety["checks"].items():
                         icon = "✅" if result["passed"] else "❌"
                         st.write(f"{icon} **{name.replace('_', ' ').title()}** — {result['reason']}")
-                    st.caption(
-                        "LP lock and honeypot checks need a dedicated integration "
-                        "(e.g. Streamflow/Team Finance locker reads, or a swap-simulation "
-                        "call) — see README.md 'Extending live mode'."
-                    )
+
+                    if rc_data.get("error"):
+                        st.caption(f"⚠️ RugCheck lookup failed ({rc_data['error']}) — LP lock and honeypot proxy show as unknown/blocked above rather than a guess.")
+                    else:
+                        if rc_data.get("score") is not None:
+                            st.caption(f"RugCheck aggregate risk score: {rc_data['score']}")
+                        if rc_data.get("risks"):
+                            with st.expander(f"RugCheck flagged {len(rc_data['risks'])} risk(s) — tap to view"):
+                                for risk in rc_data["risks"]:
+                                    if isinstance(risk, dict):
+                                        st.write(f"- **{risk.get('name', 'Unknown risk')}** ({risk.get('level', 'n/a')})")
+                        st.caption(
+                            "Honeypot check is a proxy based on RugCheck's own risk flags, "
+                            "not a live sell-simulation — treat it as one more data point."
+                        )
     else:
         if tokens_df.empty:
             st.info("No token data loaded.")

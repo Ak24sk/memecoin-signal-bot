@@ -101,4 +101,6 @@ class SolanaClient:
         return (result or {}).get("value", [])
 
     def get_token_supply(self, mint_address: str):
-        return self._call("getTokenSupply", [mint_address])
+        """Total supply info for a mint: {amount, decimals, uiAmount, uiAmountString}."""
+        result = self._call("getTokenSupply", [mint_address])
+        return (result or {}).get("value") or {}

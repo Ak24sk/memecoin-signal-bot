@@ -1,5 +1,5 @@
 """
-buy_sell.py
+modules/buy_sell.py
 -----------
 Heuristic buy/sell detection from a wallet's parsed transaction history.
 

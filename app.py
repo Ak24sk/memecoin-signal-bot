@@ -27,6 +27,7 @@ from modules import buy_sell as bs
 from modules import convergence as conv
 from modules import x_attention as xa
 from modules import safety_gate as sg
+from modules import rugcheck as rc
 from modules.solana_client import SolanaClient, SolanaRpcError
 
 st.set_page_config(

@@ -27,14 +27,8 @@ import requests
 RUGCHECK_BASE_URL = "https://api.rugcheck.xyz/v1"
 REQUEST_TIMEOUT = 10
 
-# A market's LP is treated as "locked" if at least this share of LP tokens
-# are reported locked/burned. RugCheck reports this per-market; we take the
-# best (highest) figure across all markets found for the mint.
 LP_LOCKED_THRESHOLD = 0.80
 
-# RugCheck risk severities that should count as a hard red flag for our
-# honeypot proxy. Exact level strings can vary by RugCheck API version, so
-# we match case-insensitively against a small set of known "bad" labels.
 HIGH_SEVERITY_LEVELS = {"danger", "high", "critical"}
 
 
@@ -59,10 +53,24 @@ def get_token_summary(mint_address: str) -> Dict:
 
 def derive_lp_lock_status(summary: Dict) -> Optional[bool]:
     """
-    Look through the summary's reported markets for LP-lock percentage data.
+    RugCheck's summary report puts LP-lock data at the top level as
+    `lpLockedPct` (0-100, confirmed against a live response). We fall back
+    to checking a nested `markets`/`liquidity` list for older or alternate
+    response shapes.
+
     Returns True/False if we found usable data, or None if the response
     didn't include anything we recognize as LP-lock info.
     """
+    top_level_pct = summary.get("lpLockedPct")
+    if top_level_pct is not None:
+        try:
+            pct = float(top_level_pct)
+            if pct > 1:
+                pct = pct / 100.0
+            return pct >= LP_LOCKED_THRESHOLD
+        except (TypeError, ValueError):
+            pass
+
     markets = summary.get("markets") or summary.get("liquidity") or []
     if not isinstance(markets, list) or not markets:
         return None
@@ -80,7 +88,6 @@ def derive_lp_lock_status(summary: Dict) -> Optional[bool]:
         if pct is not None:
             try:
                 pct = float(pct)
-                # Some responses report 0-1, others 0-100 — normalize to 0-1.
                 if pct > 1:
                     pct = pct / 100.0
                 if best_locked_pct is None or pct > best_locked_pct:
@@ -96,10 +103,9 @@ def derive_lp_lock_status(summary: Dict) -> Optional[bool]:
 def derive_honeypot_proxy(summary: Dict) -> Optional[bool]:
     """
     Proxy for "is this token sellable" based on RugCheck's own aggregated
-    risk flags, since we don't run a real sell-simulation here. Returns
-    False (flagged) if any high-severity risk is present, True if RugCheck
-    reported risks but none were high-severity, or None if no risk list was
-    present at all (i.e. we genuinely don't know).
+    risk flags. Returns False (flagged) if any high-severity risk is
+    present, True if RugCheck reported risks but none were high-severity,
+    or None if no risk list was present at all.
     """
     risks = summary.get("risks")
     if risks is None:
@@ -117,22 +123,31 @@ def derive_honeypot_proxy(summary: Dict) -> Optional[bool]:
     return True
 
 
+def get_lp_locked_pct(summary: Dict) -> Optional[float]:
+    """Raw LP-locked percentage (0-100) if RugCheck reported one, else None."""
+    pct = summary.get("lpLockedPct")
+    if pct is not None:
+        try:
+            return float(pct)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def get_lp_lock_and_honeypot(mint_address: str) -> Dict:
     """
     Convenience wrapper: fetches the RugCheck summary once and returns both
-    derived signals plus the raw risk list (for display), so the UI can
-    show *why* something was flagged, not just a bare pass/fail.
+    derived signals plus the raw risk list (for display).
 
     On any failure, returns all-None values with an `error` message instead
-    of raising, so a flaky third-party API never crashes the app — the
-    safety gate already treats None as "status unknown" and blocks
-    accordingly.
+    of raising, so a flaky third-party API never crashes the app.
     """
     try:
         summary = get_token_summary(mint_address)
     except RugCheckError as e:
         return {
             "lp_locked": None,
+            "lp_locked_pct": None,
             "honeypot_proxy": None,
             "risks": [],
             "score": None,
@@ -141,8 +156,9 @@ def get_lp_lock_and_honeypot(mint_address: str) -> Dict:
 
     return {
         "lp_locked": derive_lp_lock_status(summary),
+        "lp_locked_pct": get_lp_locked_pct(summary),
         "honeypot_proxy": derive_honeypot_proxy(summary),
         "risks": summary.get("risks") or [],
         "score": summary.get("score"),
         "error": None,
-}
+    }

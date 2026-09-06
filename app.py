@@ -28,6 +28,7 @@ from modules import convergence as conv
 from modules import x_attention as xa
 from modules import safety_gate as sg
 from modules import rugcheck as rc
+from modules import backtest as bt
 from modules.solana_client import SolanaClient, SolanaRpcError
 
 st.set_page_config(
@@ -107,6 +108,7 @@ tabs = st.tabs([
     "📣 X Attention",
     "🛡️ Safety Gate",
     "🔍 Token Inspector",
+    "📈 Score Validation",
 ])
 
 
@@ -514,3 +516,64 @@ with tabs[6]:
             st.info("No token data loaded.")
         else:
             st.dataframe(tokens_df, use_container_width=True)
+def _score_validation_tab():
+    pass
+
+
+with tabs[7]:
+    st.subheader("Score validation")
+    st.caption(
+        "Checks scores against real token prices afterward using free "
+        "GeckoTerminal data. Requires REAL mint addresses - Demo Mode's "
+        "synthetic tokens won't return data."
+    )
+    st.info(
+        "A correlation near zero is a legitimate result, not a bug. "
+        "Small samples can look misleadingly strong by chance.",
+        icon="⚠️",
+    )
+
+    if buys_df.empty:
+        st.warning("No buy-event data loaded. Use CSV Upload with real mint addresses.")
+    else:
+        horizon_label = st.selectbox(
+            "Check price this long after each buy",
+            ["1 hour", "6 hours", "24 hours", "3 days"], index=0,
+        )
+        horizon_map = {"1 hour": 3600, "6 hours": 6*3600, "24 hours": 24*3600, "3 days": 3*24*3600}
+        horizon_seconds = horizon_map[horizon_label]
+
+        max_trades = st.slider("Max trades to check", min_value=3, max_value=30, value=10)
+        st.caption(f"Roughly {max_trades*2}-{max_trades*3} API calls, rate-limited - may take a minute.")
+
+
+if st.button("Run validation", type="primary"):
+            events = buys_df.copy()
+            if "combined_score" not in events.columns:
+                events["combined_score"] = 50
+
+            progress = st.progress(0.0, text="Fetching real prices...")
+
+            def _update_progress(done, total):
+                progress.progress(done / total, text=f"Checked {done}/{total} trades...")
+
+            evaluated = bt.evaluate_trades(
+                events.to_dict("records"), horizon_seconds=horizon_seconds,
+                max_trades=max_trades, progress_callback=_update_progress,
+            )
+            summary = bt.summarize_validation(evaluated)
+
+            st.markdown("---")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Trades with price data", f"{summary['trades_with_price_data']}/{summary['total_trades']}")
+            c2.metric("Correlation", summary["correlation"] if summary["correlation"] is not None else "n/a")
+            c3.metric("Avg forward return", f"{summary['avg_forward_return_pct']}%" if summary["avg_forward_return_pct"] is not None else "n/a")
+            st.write(summary["interpretation"])
+
+            results_df = pd.DataFrame(evaluated)
+            if not results_df.empty:
+                cols = [c for c in ["wallet", "ticker", "token_mint", "combined_score", "forward_return_pct"] if c in results_df.columns]
+                st.dataframe(results_df[cols], use_container_width=True)
+                chartable = results_df.dropna(subset=["forward_return_pct"])
+                if len(chartable) >= 2:
+                    st.scatter_chart(chartable, x="combined_score", y="forward_return_pct")
